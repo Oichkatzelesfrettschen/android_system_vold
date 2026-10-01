@@ -35,13 +35,15 @@
 #include <cutils/fs.h>
 #include <selinux/android.h>
 
+#include "LegacyVendorData.h"
 #include "Utils.h"
 #include "android/os/IVold.h"
 
 #include <private/android_filesystem_config.h>
 
 static void usage(const char* progname) {
-    std::cerr << "Usage: " << progname << " [ prepare | destroy ] <volume_uuid> <user_id> <flags>"
+    std::cerr << "Usage: " << progname << " [ prepare | destroy ] <volume_uuid> <user_id> <flags>\n"
+              << "       " << progname << " migrate-vendor-data <legacy-directory> <vendor-directory>"
               << std::endl;
     exit(-1);
 }
@@ -290,6 +292,19 @@ static bool destroy_subdirs(const std::string& volume_uuid, int user_id, int fla
 int main(int argc, const char* const argv[]) {
     android::base::InitLogging(const_cast<char**>(argv));
     std::vector<std::string> args(argv + 1, argv + argc);
+
+    if (args.size() == 3 && args[0] == "migrate-vendor-data") {
+        if (!android::vold::IsLegacyVendorMigrationPathPair(args[1], args[2])) {
+            LOG(ERROR) << "Vendor migration requires a legacy /data path and a /data/vendor target";
+            return -1;
+        }
+        std::string error;
+        if (!android::vold::MigrateLegacyVendorDirectory(args[1], args[2], &error)) {
+            LOG(ERROR) << "Vendor data migration failed for " << args[1] << ": " << error;
+            return -1;
+        }
+        return 0;
+    }
 
     if (args.size() != 4 || !valid_uuid(args[1]) || !small_int(args[2]) || !small_int(args[3])) {
         usage(argv[0]);

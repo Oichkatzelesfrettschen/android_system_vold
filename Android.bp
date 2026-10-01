@@ -242,6 +242,7 @@ cc_binary {
 
     srcs: [
         "vold_prepare_subdirs.cpp",
+        "LegacyVendorData.cpp",
         "Utils.cpp",
     ],
     shared_libs: [
@@ -254,6 +255,19 @@ cc_binary {
     static_libs: [
         "libvold_binder",
     ],
+}
+
+cc_test_host {
+    name: "vold_legacy_vendor_data_test",
+    defaults: ["vold_default_flags"],
+    gtest: false,
+    cppflags: ["-fexceptions"],
+    srcs: [
+        "LegacyVendorData.cpp",
+        "tests/LegacyVendorDataTest.cpp",
+    ],
+    local_include_dirs: ["."],
+    shared_libs: ["libbase"],
 }
 
 filegroup {
