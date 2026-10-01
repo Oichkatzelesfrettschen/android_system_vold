@@ -30,6 +30,7 @@
 #include <sys/types.h>
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/scopeguard.h>
 
 #include <cutils/fs.h>
@@ -43,8 +44,10 @@
 
 static void usage(const char* progname) {
     std::cerr << "Usage: " << progname << " [ prepare | destroy ] <volume_uuid> <user_id> <flags>\n"
-              << "       " << progname << " migrate-vendor-data <legacy-directory> <vendor-directory>"
-              << std::endl;
+              << "       " << progname
+              << " migrate-vendor-data <legacy-directory> <vendor-directory>"
+              << " [<octal-mode> <uid> <gid> <ready-property>"
+              << " [<child-name> <octal-mode> <uid> <gid>]...]" << std::endl;
     exit(-1);
 }
 
@@ -293,12 +296,55 @@ int main(int argc, const char* const argv[]) {
     android::base::InitLogging(const_cast<char**>(argv));
     std::vector<std::string> args(argv + 1, argv + argc);
 
-    if (args.size() == 3 && args[0] == "migrate-vendor-data") {
+    if ((args.size() == 3 || (args.size() >= 7 && (args.size() - 7) % 4 == 0)) &&
+        args[0] == "migrate-vendor-data") {
         if (!android::vold::IsLegacyVendorMigrationPathPair(args[1], args[2])) {
             LOG(ERROR) << "Vendor migration requires a legacy /data path and a /data/vendor target";
             return -1;
         }
         std::string error;
+        if (args.size() >= 7) {
+            android::vold::LegacyVendorOwnership ownership;
+            if (!android::vold::ParseLegacyVendorOwnership(args[3], args[4], args[5], &ownership)) {
+                LOG(ERROR) << "Vendor migration requires an octal mode and numeric uid/gid";
+                return -1;
+            }
+            std::vector<android::vold::LegacyVendorSubdirectory> subdirectories;
+            for (size_t index = 7; index < args.size(); index += 4) {
+                android::vold::LegacyVendorSubdirectory subdirectory;
+                subdirectory.name = args[index];
+                if (!android::vold::IsLegacyVendorSubdirectoryName(subdirectory.name) ||
+                    !android::vold::ParseLegacyVendorOwnership(args[index + 1], args[index + 2],
+                                                               args[index + 3],
+                                                               &subdirectory.ownership)) {
+                    LOG(ERROR) << "Vendor migration requires a child name and valid ownership";
+                    return -1;
+                }
+                subdirectories.push_back(subdirectory);
+            }
+            if (!android::vold::PrepareLegacyVendorDirectory(args[1], args[2], ownership, &error)) {
+                LOG(ERROR) << "Vendor data preparation failed for " << args[1] << ": " << error;
+                return -1;
+            }
+            if (!android::vold::PrepareLegacyVendorSubdirectories(args[2], subdirectories,
+                                                                  &error)) {
+                LOG(ERROR) << "Vendor child preparation failed for " << args[2] << ": " << error;
+                return -1;
+            }
+            if (selinux_android_restorecon(args[2].c_str(),
+                                           SELINUX_ANDROID_RESTORECON_RECURSE |
+                                                   SELINUX_ANDROID_RESTORECON_FORCE) != 0 ||
+                selinux_android_restorecon(args[1].c_str(), SELINUX_ANDROID_RESTORECON_FORCE) !=
+                        0) {
+                PLOG(ERROR) << "Vendor data relabel failed for " << args[1];
+                return -1;
+            }
+            if (!android::base::SetProperty(args[6], "1")) {
+                LOG(ERROR) << "Vendor data ready notification failed for " << args[6];
+                return -1;
+            }
+            return 0;
+        }
         if (!android::vold::MigrateLegacyVendorDirectory(args[1], args[2], &error)) {
             LOG(ERROR) << "Vendor data migration failed for " << args[1] << ": " << error;
             return -1;

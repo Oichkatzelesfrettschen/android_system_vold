@@ -18,11 +18,15 @@
 
 #include <android-base/unique_fd.h>
 
+#include <linux/capability.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -203,6 +207,138 @@ void CrossFilesystem(const fs::path& root, const fs::path& other_root) {
     std::cout << "PASS cross-filesystem rejection retains source contents and metadata\n";
 }
 
+void OwnershipPreparation(const fs::path& root) {
+    using android::vold::LegacyVendorOwnership;
+    using android::vold::ParseLegacyVendorOwnership;
+    LegacyVendorOwnership ownership = {};
+    Require(ParseLegacyVendorOwnership("2770", std::to_string(getuid()), std::to_string(getgid()),
+                                       &ownership),
+            "parse setgid directory ownership");
+    Require(ownership.mode == 02770 && ownership.uid == getuid() && ownership.gid == getgid(),
+            "parsed mode and ownership");
+    for (const std::string& invalid : {"-1", "8", "10000", "0770x", "", "+770"}) {
+        Require(!ParseLegacyVendorOwnership(invalid, "0", "0", &ownership),
+                "reject invalid octal mode");
+    }
+    Require(!ParseLegacyVendorOwnership("770", "4294967295", "0", &ownership),
+            "reject uid sentinel");
+    Require(!ParseLegacyVendorOwnership("770", "0", "-1", &ownership), "reject negative gid");
+    auto directory = Case(root, "ownership-preparation");
+    auto source = directory / "legacy";
+    auto destination = directory / "vendor";
+    fs::create_directory(source);
+    Write(source / "state", "retained while preparing root metadata");
+    const auto before_file = Metadata(source / "state");
+    std::string error;
+    Require(android::vold::PrepareLegacyVendorDirectory(source, destination, ownership, &error),
+            "prepare destination metadata: " + error);
+    const auto after_directory = Metadata(destination);
+    Require((after_directory.st_mode & 07777) == ownership.mode &&
+                    after_directory.st_uid == ownership.uid &&
+                    after_directory.st_gid == ownership.gid,
+            "prepared destination ownership and complete mode");
+    PreserveMetadata(before_file, Metadata(source / "state"));
+    Require(Read(source / "state") == "retained while preparing root metadata",
+            "prepared contents");
+    Require(android::vold::PrepareLegacyVendorDirectory(source, destination, ownership, &error),
+            "retry final ownership preparation: " + error);
+    const std::vector<android::vold::LegacyVendorSubdirectory> children = {
+            {"mq", {0770, getuid(), getgid()}}, {"gpsone_d", {0750, getuid(), getgid()}}};
+    Require(android::vold::PrepareLegacyVendorSubdirectories(destination, children, &error),
+            "prepare child directories: " + error);
+    Require((Metadata(destination / "mq").st_mode & 07777) == 0770 &&
+                    (Metadata(destination / "gpsone_d").st_mode & 07777) == 0750,
+            "prepared child directory modes");
+    Write(destination / "mq/state", "retained child state");
+    const auto before_child = Metadata(destination / "mq/state");
+    Require(android::vold::PrepareLegacyVendorSubdirectories(destination, children, &error),
+            "retry child preparation: " + error);
+    PreserveMetadata(before_child, Metadata(destination / "mq/state"));
+    Require(Read(destination / "mq/state") == "retained child state", "child content retained");
+    auto outside = directory / "outside";
+    fs::create_directory(outside);
+    const auto before_outside = Metadata(outside);
+    fs::create_symlink(outside, destination / "unsafe-link");
+    Require(!android::vold::PrepareLegacyVendorSubdirectories(destination,
+                                                              {{"unsafe-link", ownership}}, &error),
+            "reject child symlink");
+    PreserveMetadata(before_outside, Metadata(outside));
+    Require(!android::vold::PrepareLegacyVendorSubdirectories(destination,
+                                                              {{"../outside", ownership}}, &error),
+            "reject child traversal");
+    Write(destination / "regular-file", "retain conflicting child file");
+    Require(!android::vold::PrepareLegacyVendorSubdirectories(
+                    destination, {{"regular-file", ownership}}, &error),
+            "reject child regular file");
+    Require(Read(destination / "regular-file") == "retain conflicting child file",
+            "child regular file retained");
+    std::cout << "PASS ownership parsing, preparation, setgid retention and retry\n";
+    std::cout
+            << "PASS child directory modes, retry, content retention and unsafe-object rejection\n";
+}
+
+void SetgidCapabilityBoundary(const fs::path& root) {
+    if (getuid() != 0) {
+        std::cout
+                << "SKIP cross-group CAP_FSETID test requires uid 0; Android device gate runs it\n";
+        return;
+    }
+    const int group_count = getgroups(0, nullptr);
+    Require(group_count >= 0, "count supplementary groups");
+    std::vector<gid_t> groups(static_cast<size_t>(group_count));
+    Require(getgroups(static_cast<int>(groups.size()), groups.data()) >= 0,
+            "read supplementary groups");
+    Require(getgid() != 1000 && std::find(groups.begin(), groups.end(), 1000) == groups.end(),
+            "setgid fixture requires a caller outside group 1000");
+    const android::vold::LegacyVendorOwnership ownership = {02770, 0, 1000};
+    auto directory = Case(root, "cross-group-setgid");
+    auto source = directory / "legacy";
+    auto destination = directory / "vendor";
+    fs::create_directory(source);
+    std::string error;
+    Require(android::vold::PrepareLegacyVendorDirectory(source, destination, ownership, &error),
+            "cross-group setgid preparation: " + error);
+    Require((Metadata(destination).st_mode & 07777) == 02770, "cross-group setgid retained");
+
+    directory = Case(root, "missing-fsetid-capability");
+    source = directory / "legacy";
+    destination = directory / "vendor";
+    fs::create_directory(source);
+    Write(source / "state", "retained after metadata verification failure");
+    const auto before_file = Metadata(source / "state");
+    pid_t child = fork();
+    Require(child >= 0, "fork capability-boundary child");
+    if (child == 0) {
+        __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+        __user_cap_data_struct capabilities[2] = {};
+        if (syscall(SYS_capget, &header, capabilities) != 0) _exit(10);
+        const unsigned int capability_mask = 1U << CAP_FSETID;
+        if ((capabilities[0].effective & capability_mask) == 0) _exit(11);
+        capabilities[0].effective &= ~capability_mask;
+        capabilities[0].permitted &= ~capability_mask;
+        if (syscall(SYS_capset, &header, capabilities) != 0) _exit(12);
+        bool prepared =
+                android::vold::PrepareLegacyVendorDirectory(source, destination, ownership, &error);
+        if (prepared || error.find("requested mode or owner") == std::string::npos) _exit(13);
+        struct stat metadata = {};
+        if (lstat(destination.c_str(), &metadata) != 0 || (metadata.st_mode & S_ISGID) != 0 ||
+            metadata.st_gid != 1000)
+            _exit(14);
+        _exit(0);
+    }
+    int status = 0;
+    Require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "capability-boundary child status " + std::to_string(status));
+    PreserveMetadata(before_file, Metadata(source / "state"));
+    Require(Read(source / "state") == "retained after metadata verification failure",
+            "metadata-failure contents retained");
+    Require(android::vold::PrepareLegacyVendorDirectory(source, destination, ownership, &error),
+            "retry metadata preparation with CAP_FSETID: " + error);
+    Require((Metadata(destination).st_mode & 07777) == 02770,
+            "retry restores requested setgid mode");
+    std::cout << "PASS cross-group setgid, dropped CAP_FSETID rejection, retained data and retry\n";
+}
+
 void CommandPathBoundary() {
     using android::vold::IsLegacyVendorMigrationPathPair;
     Require(IsLegacyVendorMigrationPathPair("/data/misc/location", "/data/vendor/location"),
@@ -237,6 +373,8 @@ int main(int argc, char** argv) {
         Require(fs::is_directory(other_root) && fs::is_empty(other_root),
                 "other filesystem fixture root must be empty");
         CommandPathBoundary();
+        OwnershipPreparation(root);
+        SetgidCapabilityBoundary(root);
         MigrationAndLifecycle(root);
         Conflicts(root);
         RecoveryAndFreshData(root);

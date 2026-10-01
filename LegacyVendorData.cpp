@@ -22,7 +22,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace android::vold {
@@ -52,10 +54,13 @@ bool SplitPath(const std::string& path, std::vector<std::string>* components) {
 }
 
 android::base::unique_fd OpenParent(const std::vector<std::string>& components) {
-    android::base::unique_fd directory(open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    // Ancestors need path search; only the final parent needs a syncable FD.
+    const int root_mode = components.size() == 1 ? O_RDONLY : O_PATH;
+    android::base::unique_fd directory(open("/", root_mode | O_DIRECTORY | O_CLOEXEC));
     for (size_t index = 0; directory.ok() && index + 1 < components.size(); ++index) {
+        const int mode = index + 2 == components.size() ? O_RDONLY : O_PATH;
         directory.reset(openat(directory.get(), components[index].c_str(),
-                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+                               mode | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     }
     return directory;
 }
@@ -82,6 +87,34 @@ bool IsAncestor(const std::string& parent, const std::string& child) {
            child[parent.size()] == '/';
 }
 
+template <typename Integer>
+bool ParseUnsigned(const std::string& input, int base, Integer maximum, Integer* value) {
+    Integer parsed = 0;
+    const auto result = std::from_chars(input.data(), input.data() + input.size(), parsed, base);
+    if (result.ec != std::errc() || result.ptr != input.data() + input.size() || parsed > maximum) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool SetOwnershipAndMode(int descriptor, const LegacyVendorOwnership& ownership,
+                         std::string* error) {
+    if (fchown(descriptor, ownership.uid, ownership.gid) != 0 ||
+        fchmod(descriptor, ownership.mode) != 0) {
+        return FailErrno(error, "set prepared directory metadata");
+    }
+    struct stat metadata = {};
+    if (fstat(descriptor, &metadata) != 0) return FailErrno(error, "stat prepared directory");
+    // chmod may succeed after clearing setgid when CAP_FSETID is absent.
+    if (metadata.st_uid != ownership.uid || metadata.st_gid != ownership.gid ||
+        (metadata.st_mode & 07777) != ownership.mode) {
+        return Fail(error, "prepared directory differs from requested mode or owner");
+    }
+    if (fsync(descriptor) != 0) return FailErrno(error, "sync prepared directory metadata");
+    return true;
+}
+
 }  // namespace
 
 bool IsLegacyVendorMigrationPathPair(const std::string& source, const std::string& destination) {
@@ -92,6 +125,25 @@ bool IsLegacyVendorMigrationPathPair(const std::string& source, const std::strin
            source_components[0] == "data" && source_components[1] != "vendor" &&
            destination_components.size() >= 3 && destination_components[0] == "data" &&
            destination_components[1] == "vendor";
+}
+
+bool ParseLegacyVendorOwnership(const std::string& mode, const std::string& uid,
+                                const std::string& gid, LegacyVendorOwnership* ownership) {
+    LegacyVendorOwnership parsed = {};
+    if (!ParseUnsigned(mode, 8, static_cast<mode_t>(07777), &parsed.mode) ||
+        !ParseUnsigned(uid, 10, static_cast<uid_t>(std::numeric_limits<uid_t>::max() - 1),
+                       &parsed.uid) ||
+        !ParseUnsigned(gid, 10, static_cast<gid_t>(std::numeric_limits<gid_t>::max() - 1),
+                       &parsed.gid)) {
+        return false;
+    }
+    *ownership = parsed;
+    return true;
+}
+
+bool IsLegacyVendorSubdirectoryName(const std::string& name) {
+    return !name.empty() && name != "." && name != ".." && name.find('/') == std::string::npos &&
+           name.find('\0') == std::string::npos;
 }
 
 bool MigrateLegacyVendorDirectory(const std::string& source, const std::string& destination,
@@ -170,6 +222,50 @@ bool MigrateLegacyVendorDirectory(const std::string& source, const std::string& 
         return FailErrno(error, "create compatibility link");
     }
     if (fsync(source_parent.get()) != 0) return FailErrno(error, "sync compatibility link");
+    return true;
+}
+
+bool PrepareLegacyVendorDirectory(const std::string& source, const std::string& destination,
+                                  const LegacyVendorOwnership& ownership, std::string* error) {
+    if (!MigrateLegacyVendorDirectory(source, destination, error)) return false;
+    std::vector<std::string> components;
+    if (!SplitPath(destination, &components)) return Fail(error, "invalid destination path");
+    auto parent = OpenParent(components);
+    if (!parent.ok()) return FailErrno(error, "open prepared destination parent");
+    android::base::unique_fd directory(openat(parent.get(), components.back().c_str(),
+                                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!directory.ok()) return FailErrno(error, "open prepared destination");
+    // chown may clear setgid; apply the complete mode after ownership.
+    return SetOwnershipAndMode(directory.get(), ownership, error);
+}
+
+bool PrepareLegacyVendorSubdirectories(const std::string& destination,
+                                       const std::vector<LegacyVendorSubdirectory>& subdirectories,
+                                       std::string* error) {
+    for (const auto& subdirectory : subdirectories) {
+        if (!IsLegacyVendorSubdirectoryName(subdirectory.name)) {
+            return Fail(error, "subdirectory requires a single relative name");
+        }
+    }
+    std::vector<std::string> components;
+    if (!SplitPath(destination, &components)) return Fail(error, "invalid destination path");
+    auto parent = OpenParent(components);
+    if (!parent.ok()) return FailErrno(error, "open subdirectory destination parent");
+    android::base::unique_fd directory(openat(parent.get(), components.back().c_str(),
+                                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!directory.ok()) return FailErrno(error, "open subdirectory destination");
+    for (const auto& subdirectory : subdirectories) {
+        if (mkdirat(directory.get(), subdirectory.name.c_str(), 0700) != 0 && errno != EEXIST) {
+            return FailErrno(error, "create prepared subdirectory " + subdirectory.name);
+        }
+        android::base::unique_fd child(openat(directory.get(), subdirectory.name.c_str(),
+                                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (!child.ok()) return FailErrno(error, "open prepared subdirectory " + subdirectory.name);
+        if (!SetOwnershipAndMode(child.get(), subdirectory.ownership, error)) {
+            return false;
+        }
+    }
+    if (fsync(directory.get()) != 0) return FailErrno(error, "sync prepared subdirectories");
     return true;
 }
 
