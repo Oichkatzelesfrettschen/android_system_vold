@@ -236,6 +236,19 @@ cc_binary {
     shared_libs: ["libbase"],
 }
 
+// Init and the subdirectory preparer share the checked filesystem mechanism.
+cc_library_static {
+    name: "libvold_legacy_vendor_data",
+    host_supported: true,
+    recovery_available: true,
+    ramdisk_available: true,
+    vendor_ramdisk_available: true,
+    srcs: ["LegacyVendorData.cpp"],
+    export_include_dirs: ["include"],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    shared_libs: ["libbase"],
+}
+
 cc_binary {
     name: "vold_prepare_subdirs",
     defaults: ["vold_default_flags"],
@@ -253,7 +266,21 @@ cc_binary {
     ],
     static_libs: [
         "libvold_binder",
+        "libvold_legacy_vendor_data",
     ],
+}
+
+cc_test_host {
+    name: "vold_legacy_vendor_data_test",
+    defaults: ["vold_default_flags"],
+    gtest: false,
+    cppflags: ["-fexceptions"],
+    srcs: [
+        "LegacyVendorData.cpp",
+        "tests/LegacyVendorDataTest.cpp",
+    ],
+    local_include_dirs: ["."],
+    shared_libs: ["libbase"],
 }
 
 filegroup {
