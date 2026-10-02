@@ -333,7 +333,8 @@ int main(int argc, const char* const argv[]) {
             }
             if (selinux_android_restorecon(args[2].c_str(),
                                            SELINUX_ANDROID_RESTORECON_RECURSE |
-                                                   SELINUX_ANDROID_RESTORECON_FORCE) != 0 ||
+                                                   SELINUX_ANDROID_RESTORECON_FORCE |
+                                                   SELINUX_ANDROID_RESTORECON_SKIP_SEHASH) != 0 ||
                 selinux_android_restorecon(args[1].c_str(), SELINUX_ANDROID_RESTORECON_FORCE) !=
                         0) {
                 PLOG(ERROR) << "Vendor data relabel failed for " << args[1];
